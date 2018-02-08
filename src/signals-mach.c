@@ -257,6 +257,7 @@ kern_return_t catch_exception_raise(mach_port_t            exception_port,
 
 static void attach_exception_port(thread_port_t thread, int segv_only)
 {
+    return;
     kern_return_t ret;
     // http://www.opensource.apple.com/source/xnu/xnu-2782.1.97/osfmk/man/thread_set_exception_ports.html
     exception_mask_t mask = EXC_MASK_BAD_ACCESS;

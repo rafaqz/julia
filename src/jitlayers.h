@@ -37,9 +37,6 @@ extern Function *juliapersonality_func;
 
 void addTargetPasses(legacy::PassManagerBase *PM, TargetMachine *TM);
 void addOptimizationPasses(legacy::PassManagerBase *PM, int opt_level, bool dump_native=false);
-void* jl_emit_and_add_to_shadow(GlobalVariable *gv, void *gvarinit = NULL);
-void* jl_get_globalvar(GlobalVariable *gv);
-GlobalVariable *jl_get_global_for(const char *cname, void *addr, Module *M, Type*);
 void jl_finalize_module(std::unique_ptr<Module>  m);
 void jl_merge_module(Module *dest, std::unique_ptr<Module> src);
 
@@ -65,16 +62,12 @@ struct jl_returninfo_t {
 typedef std::vector<std::tuple<jl_method_instance_t*, jl_returninfo_t::CallingConv, llvm::Function*, jl_value_t*, bool>> jl_codegen_call_targets_t;
 typedef std::tuple<std::unique_ptr<Module>, jl_llvm_functions_t, jl_value_t*, uint8_t> jl_compile_result_t;
 
-void emit_cfunc_invalidate(
-        Function *gf_thunk, jl_returninfo_t::CallingConv cc,
-        jl_value_t *calltype, jl_value_t *rettype,
-        size_t nargs, size_t world);
-
 jl_compile_result_t jl_compile_linfo1(
         jl_method_instance_t *li,
         jl_code_info_t *src,
         size_t world,
         jl_codegen_call_targets_t &workqueue,
+        std::map<void *, GlobalVariable*> &globals,
         bool cache,
         const jl_cgparams_t *params);
 
@@ -82,7 +75,8 @@ void jl_compile_workqueue(
     size_t world,
     bool cache,
     std::map<jl_method_instance_t *, jl_compile_result_t> &emitted,
-    jl_codegen_call_targets_t &workqueue);
+    jl_codegen_call_targets_t &workqueue,
+    std::map<void *, GlobalVariable*> &globals);
 
 // Connect Modules via prototypes, each owned by module `M`
 static inline GlobalVariable *global_proto(GlobalVariable *G, Module *M = NULL)
@@ -120,7 +114,21 @@ static inline void add_named_global(GlobalObject *gv, T *addr, bool dllimport = 
     add_named_global(gv, (void*)(uintptr_t)addr, dllimport);
 }
 
+static inline Constant *literal_static_pointer_val(const void *p, Type *T)
+{
+    // this function will emit a static pointer into the generated code
+    // the generated code will only be valid during the current session,
+    // and thus, this should typically be avoided in new API's
+#if defined(_P64)
+    return ConstantExpr::getIntToPtr(ConstantInt::get(Type::getInt64Ty(T->getContext()), (uint64_t)p), T);
+#else
+    return ConstantExpr::getIntToPtr(ConstantInt::get(Type::getInt32Ty(T->getContext()), (uint32_t)p), T);
+#endif
+}
+
+
 void jl_init_jit(void);
+
 #if JL_LLVM_VERSION >= 40000
 typedef JITSymbol JL_JITSymbol;
 // The type that is similar to SymbolInfo on LLVM 4.0 is actually

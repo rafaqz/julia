@@ -3,46 +3,6 @@
 #include "llvm-version.h"
 #include "platform.h"
 #include "options.h"
-#include <iostream>
-#include <sstream>
-
-// analysis passes
-#include <llvm/Analysis/Passes.h>
-#include <llvm/Analysis/BasicAliasAnalysis.h>
-#include <llvm/Analysis/TypeBasedAliasAnalysis.h>
-#include <llvm/Analysis/TargetTransformInfo.h>
-#include <llvm/Analysis/TargetLibraryInfo.h>
-#include <llvm/IR/Verifier.h>
-#if defined(USE_POLLY)
-#include <polly/RegisterPasses.h>
-#include <polly/LinkAllPasses.h>
-#include <polly/CodeGen/CodegenCleanup.h>
-#if defined(USE_POLLY_ACC)
-#include <polly/Support/LinkGPURuntime.h>
-#endif
-#endif
-// for outputting assembly
-#include <llvm/CodeGen/Passes.h>
-#include <llvm/CodeGen/AsmPrinter.h>
-#include <llvm/CodeGen/MachineModuleInfo.h>
-#include <llvm/CodeGen/TargetPassConfig.h>
-#include <llvm/Target/TargetLoweringObjectFile.h>
-#include <llvm/MC/MCAsmInfo.h>
-#include <llvm/MC/MCStreamer.h>
-
-#include <llvm/Transforms/IPO.h>
-#include <llvm/Transforms/Scalar.h>
-#include <llvm/Transforms/Utils/BasicBlockUtils.h>
-#include <llvm/Transforms/Instrumentation.h>
-#include <llvm/Transforms/Vectorize.h>
-#include <llvm/Transforms/Scalar/GVN.h>
-#if JL_LLVM_VERSION >= 40000
-#include <llvm/Transforms/IPO/AlwaysInliner.h>
-#endif
-
-namespace llvm {
-    extern Pass *createLowerSimdLoopPass();
-}
 
 #if JL_LLVM_VERSION >= 40000
 #  include <llvm/Bitcode/BitcodeWriter.h>
@@ -59,20 +19,11 @@ namespace llvm {
 #include <llvm/ADT/Triple.h>
 #include <llvm/Support/TargetRegistry.h>
 #include <llvm/IR/DataLayout.h>
-#include <llvm/Support/DynamicLibrary.h>
-
-
-#include <llvm/Support/raw_ostream.h>
-#include <llvm/Support/FormattedStream.h>
-#include <llvm/ADT/StringMap.h>
-#include <llvm/ADT/StringSet.h>
-#include <llvm/ADT/SmallSet.h>
 
 using namespace llvm;
 
 #include "julia.h"
 #include "julia_internal.h"
-#include "codegen_shared.h"
 #include "jitlayers.h"
 #include "julia_assert.h"
 
@@ -84,7 +35,7 @@ template<class T> // for GlobalObject's
 static T *addComdat(T *G)
 {
 #if defined(_OS_WINDOWS_)
-    if (imaging_mode && !G->isDeclaration()) {
+    if (!G->isDeclaration()) {
         // Add comdat information to make MSVC link.exe happy
         // it's valid to emit this for ld.exe too,
         // but makes it very slow to link for no benefit
@@ -114,74 +65,34 @@ static T *addComdat(T *G)
 
 
 typedef struct {
-    Value *gv;
-    int32_t index; // uses 1-based indexing
-} jl_value_llvm;
-static std::vector<GlobalValue*> jl_sysimg_gvars;
-static std::map<void*, jl_value_llvm> jl_value_to_llvm;
-
-typedef struct {
     std::unique_ptr<Module> M;
     std::vector<GlobalValue*> jl_sysimg_fvars;
     std::vector<GlobalValue*> jl_sysimg_gvars;
     std::map<jl_method_instance_t *, std::tuple<uint8_t, uint32_t, uint32_t>> jl_fvar_map;
+    std::map<void*, int32_t> jl_value_to_llvm; // uses 1-based indexing
 } jl_native_code_desc_t;
 
-// global variables to pointers are pretty common,
-// so this method is available as a convenience for emitting them.
-// for other types, the formula for implementation is straightforward:
-// (see stringConstPtr, for an alternative example to the code below)
-//
-// if in imaging_mode, emit a GlobalVariable with the same name and an initializer to the shadow_module
-// making it valid for emission and reloading in the sysimage
-//
-// then add a global mapping to the current value (usually from calloc'd space)
-// to the execution engine to make it valid for the current session (with the current value)
-void* jl_emit_and_add_to_shadow(GlobalVariable *gv, void *gvarinit)
+extern "C"
+void jl_get_function_id(void *native_code, jl_method_instance_t *linfo,
+        uint8_t *api, uint32_t *func_idx, uint32_t *specfunc_idx)
 {
-    PointerType *T = cast<PointerType>(gv->getType()->getElementType()); // pointer is the only supported type here
-
-    GlobalVariable *shadowvar = NULL;
-    if (imaging_mode)
-        shadowvar = global_proto(gv, shadow_output);
-
-    if (shadowvar) {
-        shadowvar->setInitializer(ConstantPointerNull::get(T));
-        shadowvar->setLinkage(GlobalVariable::InternalLinkage);
-        addComdat(shadowvar);
-        if (imaging_mode && gvarinit) {
-            // make the pointer valid for future sessions
-            jl_sysimg_gvars.push_back(shadowvar);
-            jl_value_llvm gv_struct;
-            gv_struct.gv = global_proto(gv);
-            gv_struct.index = jl_sysimg_gvars.size();
-            jl_value_to_llvm[gvarinit] = gv_struct;
-        }
+    jl_native_code_desc_t *data = (jl_native_code_desc_t*)native_code;
+    // get the function index in the fvar lookup table
+    auto it = data->jl_fvar_map.find(linfo);
+    if (it != data->jl_fvar_map.end()) {
+        std::tie(*api, *func_idx, *specfunc_idx) = it->second;
     }
-
-    // make the pointer valid for this session
-    void *slot = calloc(1, sizeof(void*));
-    jl_ExecutionEngine->addGlobalMapping(gv, slot);
-    return slot;
 }
 
-GlobalVariable *jl_get_global_for(const char *cname, void *addr, Module *M, Type* T)
+extern "C"
+int32_t jl_get_llvm_gv(void *native_code, jl_value_t *p)
 {
-    // emit a GlobalVariable for a jl_value_t named "cname"
-    std::map<void*, jl_value_llvm>::iterator it;
-    // first see if there already is a GlobalVariable for this address
-    it = jl_value_to_llvm.find(addr);
-    if (it != jl_value_to_llvm.end())
-        return prepare_global_in(M, (llvm::GlobalVariable*)it->second.gv);
-
-    std::stringstream gvname;
-    gvname << cname << globalUnique++;
-    // no existing GlobalVariable, create one and store it
-    GlobalVariable *gv = new GlobalVariable(*M, T,
-                           false, GlobalVariable::ExternalLinkage,
-                           NULL, gvname.str());
-    *(void**)jl_emit_and_add_to_shadow(gv, addr) = addr;
-    return gv;
+    // map a jl_value_t memory location to a GlobalVariable
+    jl_native_code_desc_t *data = (jl_native_code_desc_t*)native_code;
+    auto it = data->jl_value_to_llvm.find(p);
+    if (it == data->jl_value_to_llvm.end())
+        return 0;
+    return it->second;
 }
 
 static void emit_offset_table(Module *mod, const std::vector<GlobalValue*> &vars, StringRef name, Type *T_psize)
@@ -191,8 +102,10 @@ static void emit_offset_table(Module *mod, const std::vector<GlobalValue*> &vars
     assert(!vars.empty());
     size_t nvars = vars.size();
     std::vector<Constant*> addrs(nvars);
-    for (size_t i = 0; i < nvars; i++)
-        addrs[i] = ConstantExpr::getBitCast(vars[i], T_psize);
+    for (size_t i = 0; i < nvars; i++) {
+        Constant *var = vars[i];
+        addrs[i] = ConstantExpr::getBitCast(var, T_psize);
+    }
     ArrayType *vars_type = ArrayType::get(T_psize, nvars);
     new GlobalVariable(*mod, vars_type, true,
                        GlobalVariable::ExternalLinkage,
@@ -241,27 +154,67 @@ static void jl_gen_llvm_globaldata(jl_native_code_desc_t *data, const char *sysi
     }
 }
 
-extern "C"
-int32_t jl_get_llvm_gv(jl_value_t *p)
+static bool is_safe_char(unsigned char c)
 {
-    // map a jl_value_t memory location to a GlobalVariable
-    auto it = jl_value_to_llvm.find(p);
-    if (it == jl_value_to_llvm.end())
-        return 0;
-    return it->second.index;
+    return ('0' <= c && c <= '9') ||
+           ('A' <= c && c <= 'Z') ||
+           ('a' <= c && c <= 'z') ||
+           (c == '_' || c == '.') ||
+           (c >= 128 && c < 255);
 }
 
-extern "C"
-void jl_get_function_id(void *native_code, jl_method_instance_t *linfo,
-        uint8_t *api, uint32_t *func_idx, uint32_t *specfunc_idx)
+static char hexchar(unsigned char c)
 {
-    jl_native_code_desc_t *data = (jl_native_code_desc_t*)native_code;
-    // get the function index in the fvar lookup table
-    auto it = data->jl_fvar_map.find(linfo);
-    if (it != data->jl_fvar_map.end()) {
-        std::tie(*api, *func_idx, *specfunc_idx) = it->second;
-    }
+    return (c <= 9 ? '0' : 'A' - 10) + c;
 }
+
+static const char *const common_names[255] = {
+//  0, 1, 2, 3, 4, 5, 6, 7, 8, 9, a, b, c, d, e, f
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0x00
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0x10
+    0, "NOT", 0, "YY", "XOR", 0, "AND", 0, 0, 0, "MUL", "SUM", 0, "SUB", 0, "DIV", // 0x20
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "COL", 0, "LT", "EQ", "GT", 0, // 0x30
+    "AT", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0x40
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "RDV", 0, "POW", 0, // 0x50
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0x60
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "OR", 0, "TLD", 0, // 0x70
+    0 };
+
+// removes special characters from the name of GlobalObjects,
+// which might cause them to be treated special by LLVM
+// or the system linker
+// the only non-identifier characters we keep are '%' and '.',
+// and all of UTF-8 above code-point 128 (except 255)
+// most are given "friendly" abbreviations
+// the remaining few will print as hex
+static void makeSafeName(GlobalObject &G)
+{
+    StringRef Name = G.getName();
+    SmallVector<char, 32> SafeName;
+    for (unsigned char c : Name.bytes()) {
+        if (is_safe_char(c))
+            SafeName.push_back(c);
+        else {
+            SafeName.push_back('%');
+            if (c == '%') {
+                SafeName.push_back('%');
+            }
+            else if (common_names[c]) {
+                SafeName.push_back(common_names[c][0]);
+                SafeName.push_back(common_names[c][1]);
+                if (common_names[c][2])
+                    SafeName.push_back(common_names[c][2]);
+            }
+            else {
+                SafeName.push_back(hexchar((c >> 4) & 0xF));
+                SafeName.push_back(hexchar(c & 0xF));
+            }
+        }
+    }
+    if (SafeName.size() != Name.size())
+        G.setName(StringRef(SafeName.data(), SafeName.size()));
+}
+
 
 // takes the running content that has collected in the shadow module and dump it to disk
 // this builds the object file portion of the sysimage files for fast startup
@@ -271,6 +224,7 @@ void *jl_create_native(jl_array_t *methods)
     jl_native_code_desc_t *data = new jl_native_code_desc_t;
     jl_codegen_call_targets_t workqueue;
     std::map<jl_method_instance_t *, jl_compile_result_t> emitted;
+    std::map<void *, GlobalVariable*> globals;
     jl_method_instance_t *mi = NULL;
     jl_code_info_t *src = NULL;
     JL_GC_PUSH1(&src);
@@ -291,15 +245,22 @@ void *jl_create_native(jl_array_t *methods)
                     src = jl_type_infer(&mi, world, 0);
                 }
                 if (!emitted.count(mi)) {
-                    jl_compile_result_t result = jl_compile_linfo1(mi, src, world, workqueue, false, &jl_default_cgparams);
+                    jl_compile_result_t result = jl_compile_linfo1(mi, src, world, workqueue, globals, false, &jl_default_cgparams);
                     if (std::get<0>(result))
                         emitted[mi] = std::move(result);
                 }
             }
         }
-        jl_compile_workqueue(world, false, emitted, workqueue);
+        jl_compile_workqueue(world, false, emitted, workqueue, globals);
     }
     JL_GC_POP();
+
+    // process the globals array, before jl_merge_module destroys them
+    std::vector<std::string> gvars;
+    for (auto &global : globals) {
+        gvars.push_back(global.second->getName());
+        data->jl_value_to_llvm[global.first] = gvars.size();
+    }
 
     // clones the contents of the module `m` to the shadow_output collector
     ValueToValueMapTy VMap;
@@ -325,17 +286,25 @@ void *jl_create_native(jl_array_t *methods)
         data->jl_fvar_map[this_li] = std::make_tuple(api, cfunc_id, func_id);
     }
 
-    for (Module::iterator I = clone->begin(), E = clone->end(); I != E; ++I) {
-        Function *F = &*I;
-        if (!F->isDeclaration()) {
-            F->setLinkage(Function::InternalLinkage);
-            addComdat(F);
+    // now get references to the globals in the merged module
+    // and set them to be internalized and initialized at startup
+    for (auto &global : gvars) {
+        GlobalVariable *G = cast<GlobalVariable>(clone->getNamedValue(global));
+        G->setInitializer(ConstantPointerNull::get(cast<PointerType>(G->getValueType())));
+        G->setLinkage(GlobalVariable::InternalLinkage);
+        data->jl_sysimg_gvars.push_back(G);
+    }
+
+    // move everything inside, now that we've merged everything
+    // (before adding the exported headers)
+    for (GlobalObject &G : clone->global_objects()) {
+        if (!G.isDeclaration()) {
+            G.setLinkage(Function::InternalLinkage);
+            makeSafeName(G);
+            addComdat(&G);
         }
     }
 
-    data->jl_sysimg_gvars = jl_sysimg_gvars;
-    for (size_t i = 0; i < data->jl_sysimg_gvars.size(); i++)
-        data->jl_sysimg_gvars[i] = cast<llvm::GlobalValue>(VMap[data->jl_sysimg_gvars[i]]);
     data->M = std::move(clone);
 
     JL_UNLOCK(&codegen_lock); // Might GC
@@ -363,21 +332,21 @@ void jl_dump_native(void *native_code,
     TheTriple.setObjectFormat(Triple::MachO);
     TheTriple.setOS(llvm::Triple::MacOSX);
 #endif
-    std::unique_ptr<TargetMachine>
-    TM(jl_TargetMachine->getTarget().createTargetMachine(
-        TheTriple.getTriple(),
-        jl_TargetMachine->getTargetCPU(),
-        jl_TargetMachine->getTargetFeatureString(),
-        jl_TargetMachine->Options,
+    std::unique_ptr<TargetMachine> TM(
+        jl_TargetMachine->getTarget().createTargetMachine(
+            TheTriple.getTriple(),
+            jl_TargetMachine->getTargetCPU(),
+            jl_TargetMachine->getTargetFeatureString(),
+            jl_TargetMachine->Options,
 #if defined(_OS_LINUX_) || defined(_OS_FREEBSD_)
-        Reloc::PIC_,
+            Reloc::PIC_,
 #else
-        Optional<Reloc::Model>(),
+            Optional<Reloc::Model>(),
 #endif
-        // Use small model so that we can use signed 32bits offset in the function and GV tables
-        CodeModel::Small,
-        CodeGenOpt::Aggressive // -O3 TODO: respect command -O0 flag?
-        ));
+            // Use small model so that we can use signed 32bits offset in the function and GV tables
+            CodeModel::Small,
+            CodeGenOpt::Aggressive // -O3 TODO: respect command -O0 flag?
+            ));
 
     legacy::PassManager PM;
     addTargetPasses(&PM, TM.get());
@@ -464,12 +433,5 @@ void jl_add_to_shadow(Module *m)
 {
     ValueToValueMapTy VMap;
     std::unique_ptr<Module> clone(CloneModule(m, VMap));
-    for (Module::iterator I = clone->begin(), E = clone->end(); I != E; ++I) {
-        Function *F = &*I;
-        if (!F->isDeclaration()) {
-            F->setLinkage(Function::InternalLinkage);
-            addComdat(F);
-        }
-    }
     jl_merge_module(shadow_output, std::move(clone));
 }

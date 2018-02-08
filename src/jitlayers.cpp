@@ -339,6 +339,17 @@ static void jl_add_to_ee();
 static uint64_t getAddressForFunction(StringRef fname);
 extern "C" tracer_cb jl_linfo_tracer;
 
+void jl_jit_globals(std::map<void *, GlobalVariable*> &globals)
+{
+    for (auto &global : globals) {
+        Constant *P = literal_static_pointer_val(global.first, global.second->getValueType());
+        global.second->setInitializer(P);
+        global.second->setConstant(true);
+        global.second->setLinkage(GlobalValue::PrivateLinkage);
+        global.second->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    }
+}
+
 // this generates llvm code for the lambda info
 // and adds the result to the jitlayers
 // (and the shadow module),
@@ -364,12 +375,14 @@ static jl_generic_fptr_t _jl_compile_linfo(
     jl_generic_fptr_t fptr = {};
     // emit the code in LLVM IR form
     jl_codegen_call_targets_t workqueue;
+    std::map<void *, GlobalVariable*> globals;
     std::map<jl_method_instance_t *, std::tuple<std::unique_ptr<Module>, jl_llvm_functions_t, jl_value_t*, uint8_t>> emitted;
-    jl_compile_result_t result = jl_compile_linfo1(li, src, world, workqueue, true, &jl_default_cgparams);
+    jl_compile_result_t result = jl_compile_linfo1(li, src, world, workqueue, globals, true, &jl_default_cgparams);
     if (std::get<0>(result))
         emitted[li] = std::move(result);
-    jl_compile_workqueue(world, true, emitted, workqueue);
+    jl_compile_workqueue(world, true, emitted, workqueue, globals);
 
+    jl_jit_globals(globals);
     for (auto &def : emitted) {
         // Add the results to the execution engine now
         jl_finalize_module(std::move(std::get<0>(def.second)));
@@ -411,7 +424,8 @@ static jl_generic_fptr_t _jl_compile_linfo(
 
 void jl_strip_llvm_debug(Module *m);
 
-Function *jl_cfunction_object(jl_function_t *f, jl_value_t *rt, jl_tupletype_t *argt);
+Function *jl_cfunction_object(jl_function_t *f, jl_value_t *rt, jl_tupletype_t *argt,
+        std::map<void *, GlobalVariable*> &globals);
 
 // get the address of a C-callable entry point for a function
 extern "C" JL_DLLEXPORT
@@ -419,7 +433,9 @@ void *jl_function_ptr(jl_function_t *f, jl_value_t *rt, jl_value_t *argt)
 {
     JL_GC_PUSH1(&argt);
     JL_LOCK(&codegen_lock);
-    Function *llvmf = jl_cfunction_object(f, rt, (jl_tupletype_t*)argt);
+    std::map<void *, GlobalVariable*> globals;
+    Function *llvmf = jl_cfunction_object(f, rt, (jl_tupletype_t*)argt, globals);
+    jl_jit_globals(globals);
     jl_add_to_ee();
     JL_GC_POP();
     void *ptr = (void*)getAddressForFunction(llvmf->getName());
@@ -434,7 +450,9 @@ void jl_extern_c(jl_function_t *f, jl_value_t *rt, jl_value_t *argt, char *name)
 {
     assert(jl_is_tuple_type(argt));
     JL_LOCK(&codegen_lock);
-    Function *llvmf = jl_cfunction_object(f, rt, (jl_tupletype_t*)argt);
+    std::map<void *, GlobalVariable*> globals;
+    Function *llvmf = jl_cfunction_object(f, rt, (jl_tupletype_t*)argt, globals);
+    jl_jit_globals(globals);
     // force eager emission of the function (llvm 3.3 gets confused otherwise and tries to do recursive compilation)
     jl_add_to_ee();
     uint64_t Addr = getAddressForFunction(llvmf->getName());
@@ -1125,7 +1143,7 @@ void jl_merge_module(Module *dest, std::unique_ptr<Module> src)
     assert(dest != src.get());
     for (Module::global_iterator I = src->global_begin(), E = src->global_end(); I != E;) {
         GlobalVariable *sG = &*I;
-        GlobalValue *dG = dest->getNamedValue(sG->getName());
+        GlobalVariable *dG = cast_or_null<GlobalVariable>(dest->getNamedValue(sG->getName()));
         ++I;
         // Replace a declaration with the definition:
         if (dG) {
@@ -1135,6 +1153,7 @@ void jl_merge_module(Module *dest, std::unique_ptr<Module> src)
                 continue;
             }
             else {
+                assert(dG->isDeclaration() || dG->getInitializer() == sG->getInitializer());
                 dG->replaceAllUsesWith(sG);
                 dG->eraseFromParent();
             }
@@ -1148,7 +1167,7 @@ void jl_merge_module(Module *dest, std::unique_ptr<Module> src)
 
     for (Module::iterator I = src->begin(), E = src->end(); I != E;) {
         Function *sG = &*I;
-        GlobalValue *dG = dest->getNamedValue(sG->getName());
+        Function *dG = cast_or_null<Function>(dest->getNamedValue(sG->getName()));
         ++I;
         // Replace a declaration with the definition:
         if (dG) {
@@ -1158,6 +1177,7 @@ void jl_merge_module(Module *dest, std::unique_ptr<Module> src)
                 continue;
             }
             else {
+                assert(dG->isDeclaration());
                 dG->replaceAllUsesWith(sG);
                 dG->eraseFromParent();
             }
@@ -1171,7 +1191,7 @@ void jl_merge_module(Module *dest, std::unique_ptr<Module> src)
 
     for (Module::alias_iterator I = src->alias_begin(), E = src->alias_end(); I != E;) {
         GlobalAlias *sG = &*I;
-        GlobalValue *dG = dest->getNamedValue(sG->getName());
+        GlobalAlias *dG = cast_or_null<GlobalAlias>(dest->getNamedValue(sG->getName()));
         ++I;
         if (dG) {
             if (!dG->isDeclaration()) { // aliases are always definitions, so this test is reversed from the above two
@@ -1249,13 +1269,6 @@ void add_named_global(GlobalObject *gv, void *addr, bool dllimport)
 #endif // _OS_WINDOWS_
 
     jl_ExecutionEngine->addGlobalMapping(gv, addr);
-}
-
-void* jl_get_globalvar(GlobalVariable *gv)
-{
-    void *p = (void*)(intptr_t)jl_ExecutionEngine->getPointerToGlobalIfAvailable(gv);
-    assert(p);
-    return p;
 }
 
 

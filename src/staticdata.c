@@ -399,7 +399,8 @@ static void jl_write_module(jl_serializer_state *s, uintptr_t item, jl_module_t 
                 write_gctaggedfield(s, (uintptr_t)BindingRef << RELOC_TAG_OFFSET);
                 tot += sizeof(void*);
                 size_t binding_reloc_offset = ios_pos(s->s);
-                record_gvar(s, jl_get_llvm_gv((jl_value_t*)b), ((uintptr_t)DataRef << RELOC_TAG_OFFSET) + binding_reloc_offset);
+                record_gvar(s, jl_get_llvm_gv(native_functions, (jl_value_t*)b),
+                        ((uintptr_t)DataRef << RELOC_TAG_OFFSET) + binding_reloc_offset);
                 write_pointerfield(s, (jl_value_t*)b->name);
                 write_pointerfield(s, b->value);
                 write_pointerfield(s, b->globalref);
@@ -532,7 +533,7 @@ static void jl_write_values(jl_serializer_state *s)
         size_t reloc_offset = ios_pos(s->s);
         assert(item < layout_table.len && layout_table.items[item] == NULL);
         layout_table.items[item] = (void*)reloc_offset;
-        record_gvar(s, jl_get_llvm_gv(v), ((uintptr_t)DataRef << RELOC_TAG_OFFSET) + reloc_offset);
+        record_gvar(s, jl_get_llvm_gv(native_functions, v), ((uintptr_t)DataRef << RELOC_TAG_OFFSET) + reloc_offset);
 
         // write data
         if (jl_is_cpointer(v)) {
@@ -728,7 +729,7 @@ static void jl_write_gv_syms(jl_serializer_state *s, jl_sym_t *v)
 {
     // since symbols are static, they might not have had a
     // reference anywhere in the code image other than here
-    int32_t gv = jl_get_llvm_gv((jl_value_t*)v);
+    int32_t gv = jl_get_llvm_gv(native_functions, (jl_value_t*)v);
     if (gv != 0) {
         uintptr_t item = backref_id(s, v);
         assert(item >> RELOC_TAG_OFFSET == SymbolRef);
@@ -1125,11 +1126,12 @@ static void jl_prune_type_cache(jl_svec_t *cache)
         jl_value_t *ti = jl_svecref(cache, i);
         if (ti == NULL)
             break;
-        if (ptrhash_get(&backref_table, ti) != HT_NOTFOUND || jl_get_llvm_gv(ti) != 0)
+        if (ptrhash_get(&backref_table, ti) != HT_NOTFOUND || jl_get_llvm_gv(native_functions, ti) != 0)
             jl_svecset(cache, ins++, ti);
         else if (jl_is_datatype(ti)) {
             jl_value_t *singleton = ((jl_datatype_t*)ti)->instance;
-            if (singleton && (ptrhash_get(&backref_table, singleton) != HT_NOTFOUND || jl_get_llvm_gv(singleton) != 0))
+            if (singleton && (ptrhash_get(&backref_table, singleton) != HT_NOTFOUND ||
+                        jl_get_llvm_gv(native_functions, singleton) != 0))
                 jl_svecset(cache, ins++, ti);
         }
     }
@@ -1217,7 +1219,7 @@ static void jl_save_system_image_to_stream(ios_t *f)
         uintptr_t i;
         for (i = 0; i < deser_tag.len; i++) {
             jl_value_t *v = (jl_value_t*)deser_tag.items[i];
-            record_gvar(&s, jl_get_llvm_gv(v), ((uintptr_t)TagRef << RELOC_TAG_OFFSET) + i);
+            record_gvar(&s, jl_get_llvm_gv(native_functions, v), ((uintptr_t)TagRef << RELOC_TAG_OFFSET) + i);
         }
     }
 

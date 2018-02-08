@@ -4,7 +4,8 @@
 
 extern "C" JL_DLLEXPORT
 void *jl_function_ptr(jl_function_t *f, jl_value_t *rt, jl_value_t *argt);
-Function *jl_cfunction_object(jl_function_t *f, jl_value_t *rt, jl_tupletype_t *argt);
+Function *jl_cfunction_object(jl_function_t *f, jl_value_t *rt, jl_tupletype_t *argt,
+            std::map<void*, GlobalVariable*> &globals);
 
 // Map from symbol name (in a certain library) to its GV in sysimg and the
 // DL handle address in the current session.
@@ -43,6 +44,39 @@ lazyModule(Func &&func)
 {
     return LazyModule<typename std::remove_reference<Func>::type>(
         std::forward<Func>(func));
+}
+
+
+// global variables to pointers are pretty common,
+// so this method is available as a convenience for emitting them.
+// for other types, the formula for implementation is straightforward:
+// (see stringConstPtr, for an alternative example to the code below)
+//
+// if in imaging_mode, emit a GlobalVariable with the same name and an initializer to the shadow_module
+// making it valid for emission and reloading in the sysimage
+//
+// then add a global mapping to the current value (usually from calloc'd space)
+// to the execution engine to make it valid for the current session (with the current value)
+void* jl_emit_and_add_to_shadow(GlobalVariable *gv)
+{
+    // make a copy in the shadow_output
+    assert(imaging_mode);
+    PointerType *T = cast<PointerType>(gv->getValueType()); // pointer is the only supported type here
+    GlobalVariable *shadowvar = global_proto(gv, shadow_output);
+    shadowvar->setInitializer(ConstantPointerNull::get(T));
+    shadowvar->setLinkage(GlobalVariable::InternalLinkage);
+
+    // make the pointer valid for this session
+    void *slot = calloc(1, sizeof(void*));
+    jl_ExecutionEngine->addGlobalMapping(gv, slot);
+    return slot;
+}
+
+void* jl_get_globalvar(GlobalVariable *gv)
+{
+    void *p = (void*)(intptr_t)jl_ExecutionEngine->getPointerToGlobalIfAvailable(gv);
+    assert(p);
+    return p;
 }
 
 // Find or create the GVs for the library and symbol lookup.
@@ -1767,7 +1801,7 @@ static jl_cgval_t emit_ccall(jl_codectx_t &ctx, jl_value_t **args, size_t nargs)
             if (fargt && jl_is_tuple_type(fargt)) {
                 Value *llvmf = NULL;
                 JL_TRY {
-                    llvmf = jl_cfunction_object((jl_function_t*)f, frt, (jl_tupletype_t*)fargt);
+                    //llvmf = jl_cfunction_object((jl_function_t*)f, frt, (jl_tupletype_t*)fargt, ctx.global_targets);
                 }
                 JL_CATCH {
                     llvmf = NULL;
@@ -1983,7 +2017,7 @@ jl_cgval_t function_sig_t::emit_a_ccall(
     }
     else if (symarg.fptr != NULL) {
         Type *funcptype = PointerType::get(functype, 0);
-        llvmf = literal_static_pointer_val(ctx, (void*)(uintptr_t)symarg.fptr, funcptype);
+        llvmf = literal_static_pointer_val((void*)(uintptr_t)symarg.fptr, funcptype);
         if (imaging_mode)
             jl_printf(JL_STDERR,"WARNING: literal address used in ccall for %s; code cannot be statically compiled\n", symarg.f_name);
     }
@@ -2017,7 +2051,7 @@ jl_cgval_t function_sig_t::emit_a_ccall(
             }
             // since we aren't saving this code, there's no sense in
             // putting anything complicated here: just JIT the function address
-            llvmf = literal_static_pointer_val(ctx, symaddr, funcptype);
+            llvmf = literal_static_pointer_val(symaddr, funcptype);
         }
     }
 

@@ -602,7 +602,7 @@ void *jl_create_native(jl_array_t *methods);
 void jl_dump_native(void *native_code,
         const char *bc_fname, const char *unopt_bc_fname, const char *obj_fname,
         const char *sysimg_data, size_t sysimg_len);
-int32_t jl_get_llvm_gv(jl_value_t *p);
+int32_t jl_get_llvm_gv(void *native_code, jl_value_t *p);
 void jl_get_function_id(void *native_code, jl_method_instance_t *linfo,
         uint8_t *api, uint32_t *func_idx, uint32_t *specfunc_idx);
 int32_t jl_assign_functionID(const char *fname);
